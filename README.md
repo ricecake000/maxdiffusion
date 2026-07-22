@@ -794,8 +794,8 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
 
   Krea 2 (K2) is a 12.9B single-stream MMDiT text2img model conditioned on Qwen3-VL-4B text embeddings and decoded with the Qwen-Image (Wan 2.1 architecture) VAE. Two open-weight checkpoints are supported:
 
-  - `krea/Krea-2-Raw` — base (midtrain) checkpoint: 28 steps with classifier-free guidance (`guidance_scale=4.5`, Krea convention `cond + g * (cond - uncond)`).
-  - `krea/Krea-2-Turbo` — few-step distilled (TDM) checkpoint: 8 steps with guidance disabled.
+  - `krea/Krea-2-Raw` — base (midtrain) checkpoint: 52 steps with classifier-free guidance (`guidance_scale=3.5`, Krea convention `cond + g * (cond - uncond)`), per the model card. Krea positions Raw primarily as a finetuning/post-training base.
+  - `krea/Krea-2-Turbo` — few-step distilled (TDM) checkpoint: 8 steps with guidance disabled. This is the checkpoint Krea recommends for inference deployments.
 
   Krea 2 Raw:
 
@@ -809,7 +809,7 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
   python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo.yml jax_cache_dir=/tmp/cache_dir run_name=krea2_turbo output_dir=output/ prompt="a fox in the snow"
   ```
 
-  The bf16 transformer weighs ~26GB, so single-chip runs are not possible; the default config shards the model with FSDP across all devices (and falls back to tensor parallelism for `batch_size=1`). Note: with `attention: 'flash'`, per-batch text padding masks are shared from batch element 0 — use `batch_size=1` (default), identical prompts per batch, or `attention: 'dot_product'` when batching different prompts.
+  The bf16 transformer weighs ~26GB, so single-chip runs are not possible; the default config shards the model with FSDP across all devices (and falls back to tensor parallelism within a slice for `batch_size=1`). Note: with `attention: 'flash'`, per-batch text padding masks are shared from batch element 0, so `generate_krea2.py` automatically falls back to `attention: 'dot_product'` when a batch mixes different prompts (and the pipeline rejects non-uniform masks as a backstop). Heights/widths that are not multiples of 16 are rounded up with a warning.
 
   ## Wan LoRA
 

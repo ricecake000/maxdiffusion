@@ -45,6 +45,24 @@ KREA2_PROMPT_TEMPLATE_START_IDX = 34
 KREA2_PROMPT_TEMPLATE_NUM_SUFFIX_TOKENS = 5
 
 
+def round_up_to_multiple(value: int, multiple: int) -> int:
+  """Rounds `value` up to the nearest multiple of `multiple`."""
+  return ((value + multiple - 1) // multiple) * multiple
+
+
+def mask_is_batch_uniform(mask) -> bool:
+  """True if every row of a (batch, seq) mask equals the first row.
+
+  The repo's flash-attention kernels fold the key-padding mask into segment ids
+  shared from batch element 0, so non-uniform masks would be silently
+  miscomputed there.
+  """
+  mask = np.asarray(mask)
+  if mask.ndim != 2 or mask.shape[0] <= 1:
+    return True
+  return bool(np.all(mask == mask[0:1]))
+
+
 def calculate_krea2_shift(
     image_seq_len: int,
     base_seq_len: int = 256,

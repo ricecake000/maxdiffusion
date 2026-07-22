@@ -134,6 +134,7 @@ def main(argv):
   from maxdiffusion.models.krea2.util import (
       KREA2_PROMPT_TEMPLATE_START_IDX,
       load_and_convert_krea2_weights,
+      round_up_to_multiple,
   )
   from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model, load_and_convert_qwen3_weights
   from maxdiffusion.models.flux.util import cast_dict_to_bfloat16_inplace
@@ -143,13 +144,37 @@ def main(argv):
   config = pyconfig.config
   os.makedirs(config.output_dir, exist_ok=True)
 
-  # 2. Setup device meshes
-  if config.batch_size == 1 and config.ici_tensor_parallelism == 1 and jax.device_count() > 1:
+  # Resolve prompts early: the attention kernel choice below depends on whether
+  # the batch mixes different prompts.
+  active_prompts = partition_prompts(config.prompt, config.batch_size)
+
+  # The repo's flash-attention kernels share the text padding mask of batch
+  # element 0 across the whole batch. With mixed prompts in one batch that would
+  # silently miscompute every other element, so fall back to dot_product.
+  if config.attention != "dot_product" and config.batch_size > 1 and len(set(active_prompts)) > 1:
     max_logging.log(
-        f"Auto-configuring Tensor Parallelism: ici_tensor_parallelism={jax.device_count()}, "
-        f"ici_fsdp_parallelism=1 for batch_size=1 on {jax.device_count()} devices."
+        f"Warning: attention='{config.attention}' cannot honor per-batch text padding masks and the batch "
+        "mixes different prompts. Falling back to attention='dot_product'. Use identical prompts per batch "
+        "or batch_size=1 to keep flash attention."
     )
-    pyconfig._config.keys["ici_tensor_parallelism"] = jax.device_count()
+    pyconfig._config.keys["attention"] = "dot_product"
+
+  # 2. Setup device meshes
+  # The ICI parallelism product must equal the number of devices PER SLICE
+  # (see max_utils.create_device_mesh), not the global device count.
+  all_devices = jax.devices()
+  try:
+    num_slices = 1 + max(d.slice_index for d in all_devices)
+  except Exception:
+    num_slices = 1
+  devices_per_slice = len(all_devices) // num_slices
+  if config.batch_size == 1 and config.ici_tensor_parallelism == 1 and devices_per_slice > 1:
+    max_logging.log(
+        f"Auto-configuring Tensor Parallelism: ici_tensor_parallelism={devices_per_slice}, "
+        f"ici_fsdp_parallelism=1 for batch_size=1 on {devices_per_slice} devices per slice "
+        f"({num_slices} slice(s))."
+    )
+    pyconfig._config.keys["ici_tensor_parallelism"] = devices_per_slice
     pyconfig._config.keys["ici_fsdp_parallelism"] = 1
 
   max_logging.log("Setting up JAX device mesh...")
@@ -242,8 +267,19 @@ def main(argv):
 
   # 6. Evaluate shapes & extract mesh shardings
   max_logging.log("Evaluating model shapes and shardings...")
-  grid_h = config.height // 16
-  grid_w = config.width // 16
+  # Height/width must be multiples of 16 (VAE 8x downsampling x 2x2 latent
+  # patches). Round up here so the eval_shape dummies match what the pipeline
+  # (which applies the same rounding) will actually run.
+  height = round_up_to_multiple(config.height, 16)
+  width = round_up_to_multiple(config.width, 16)
+  if (height, width) != (config.height, config.width):
+    max_logging.log(
+        f"Warning: height and width must be multiples of 16; rounding up from "
+        f"{config.height}x{config.width} to {height}x{width}."
+    )
+
+  grid_h = height // 16
+  grid_w = width // 16
   seq_len_img = grid_h * grid_w
   seq_len_txt = config.max_sequence_length
   # Total tokenized length before the system prefix is dropped.
@@ -380,8 +416,6 @@ def main(argv):
       vae_logical_axis_rules=vae_logical_axis_rules,
   )
 
-  active_prompts = partition_prompts(config.prompt, config.batch_size)
-
   latents_to_use = None
   if getattr(config, "latents_path", ""):
     max_logging.log(f"Loading custom starting noise latents from: {config.latents_path}...")
@@ -391,8 +425,8 @@ def main(argv):
   call_kwargs = dict(
       params=params,
       qwen3_params=qwen3_params,
-      height=config.height,
-      width=config.width,
+      height=height,
+      width=width,
       num_inference_steps=config.num_inference_steps,
       guidance_scale=config.guidance_scale,
       negative_prompt=config.negative_prompt,

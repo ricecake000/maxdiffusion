@@ -37,7 +37,9 @@ class GenerateKrea2SmokeTest(unittest.TestCase):
     ref_path = os.path.join(THIS_DIR, "images", ref_name)
     if not os.path.exists(ref_path):
       # Reference images are produced once from a verified TPU run and committed
-      # to tests/images/. Until then the smoke test cannot score SSIM.
+      # to tests/images/. They must be generated with the config defaults, which
+      # pin the model-card sampler settings (Raw: 52 steps / guidance 3.5,
+      # Turbo: 8 steps / guidance 0.0). Until then the smoke test cannot score SSIM.
       self.skipTest(f"Reference image not found: {ref_path}. Generate it from a verified TPU run first.")
     base_image = np.array(Image.open(ref_path)).astype(np.uint8)
 

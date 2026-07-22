@@ -229,10 +229,13 @@ prompt_2: ""
 negative_prompt: ""
 do_classifier_free_guidance: True
 # Krea 2 guidance convention: velocity = cond + guidance_scale * (cond - uncond);
-# guidance is enabled whenever guidance_scale > 0. Use 4.5 for Raw, 0.0 for Turbo.
-guidance_scale: 4.5
+# guidance is enabled whenever guidance_scale > 0 (Turbo uses 0.0).
+# Raw defaults follow the krea/Krea-2-Raw model card, whose official-codebase,
+# diffusers, and SGLang examples all use 52 steps / guidance 3.5. (The diffusers
+# Krea2Pipeline code defaults, 28 steps / 4.5, are a faster alternative.)
+guidance_scale: 3.5
 guidance_rescale: 0.0
-num_inference_steps: 28
+num_inference_steps: 52
 save_final_checkpoint: False
 
 # SDXL Lightning parameters
@@ -292,6 +295,7 @@ vae_logical_axis_rules: [
 # Note: Architecture dimensions are automatically read from
 # pretrained_model_name_or_path (transformer/config.json, text_encoder/config.json).
 # NOTE: with attention: 'flash', per-batch text padding masks are shared from batch
-# element 0; use batch_size 1 (default), identical prompts per batch, or
-# attention: 'dot_product' when batching different prompts.
+# element 0. generate_krea2.py automatically falls back to attention: 'dot_product'
+# when the batch mixes different prompts, and the pipeline rejects non-uniform
+# masks as a backstop.
 
