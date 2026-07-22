@@ -99,6 +99,28 @@ class GenerateKrea2SmokeTest(unittest.TestCase):
         ref_name="ref_krea2_turbo.png",
     )
 
+  @pytest.mark.skipif(IN_GITHUB_ACTIONS, reason="Don't run smoke tests on Github Actions (requires TPU HBM)")
+  def test_krea2_turbo_lora_zero_scale_smoke(self):
+    """Runs Turbo with a LoRA adapter at scale=0 and scores against the base
+    reference image: the full LoRA path (key conversion, param-tree insertion,
+    interceptors around shape eval and the jitted denoise loop) must be
+    numerically inert at zero scale. Set KREA2_LORA_PATH to any Krea 2 LoRA
+    .safetensors file to enable."""
+    lora_path = os.environ.get("KREA2_LORA_PATH", "")
+    if not lora_path or not os.path.exists(lora_path):
+      self.skipTest("Set KREA2_LORA_PATH to a Krea 2 LoRA .safetensors file to run this test.")
+    lora_config = (
+        'lora_config={"lora_model_name_or_path": ["%s"], "weight_name": ["%s"], '
+        '"adapter_name": ["smoke"], "scale": [0.0], "from_pt": ["true"]}' % (lora_path, os.path.basename(lora_path))
+    )
+    self._run(
+        config_name="base_krea2_turbo.yml",
+        run_name="krea2_turbo_lora_smoke",
+        output_name="krea2_turbo_lora_generated_image.png",
+        ref_name="ref_krea2_turbo.png",
+        extra_args=("output_name=krea2_turbo_lora_generated_image.png", lora_config),
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

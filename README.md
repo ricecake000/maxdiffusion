@@ -17,6 +17,7 @@
 [![Unit Tests](https://github.com/AI-Hypercomputer/maxdiffusion/actions/workflows/UnitTests.yml/badge.svg)](https://github.com/AI-Hypercomputer/maxdiffusion/actions/workflows/UnitTests.yml)
 
 # What's new?
+- **`2026/07/22`**: Krea 2 LoRA for inference is now supported (kohya/ComfyUI and diffusers/PEFT formats).
 - **`2026/07/22`**: Krea 2 (Raw & Turbo) text2img inference is now supported.
 - **`2026/07/14`**: Automatic attention tile-size (`block_q`/`block_kv`) search for Wan is now supported.
 - **`2026/06/26`**: 2D ring (USP) attention with a custom splash kernel is now supported for Wan (`ulysses_ring_custom`), splitting context parallelism into an intra-chip Ulysses axis and a cross-chip ring axis.
@@ -810,6 +811,18 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
   ```
 
   The bf16 transformer weighs ~26GB, so single-chip runs are not possible; the default config shards the model with FSDP across all devices (and falls back to tensor parallelism within a slice for `batch_size=1`). Note: with `attention: 'flash'`, per-batch text padding masks are shared from batch element 0, so `generate_krea2.py` automatically falls back to `attention: 'dot_product'` when a batch mixes different prompts (and the pipeline rejects non-uniform masks as a backstop). Heights/widths that are not multiples of 16 are rounded up with a warning.
+
+  ### Krea 2 LoRA
+
+  Externally-trained LoRA adapters (`.safetensors`) can be applied to the Krea 2 transformer at inference on both Raw and Turbo. Supported key formats: kohya/ComfyUI (`lora_down`/`lora_up` + `alpha`, plus `diff`/`diff_b` weight deltas) and diffusers/PEFT (`lora_A`/`lora_B`). Text-encoder LoRA keys are ignored with a warning. Configure the `lora_config` block in `base_krea2.yml`/`base_krea2_turbo.yml` (or override it on the command line):
+
+  ```bash
+  python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo.yml \
+    jax_cache_dir=/tmp/cache_dir run_name=krea2_turbo_lora output_dir=output/ prompt="a fox in the snow" \
+    'lora_config={"lora_model_name_or_path": ["/path/to/my_krea2_lora.safetensors"], "weight_name": ["my_krea2_lora.safetensors"], "adapter_name": ["my-style"], "scale": [0.8], "from_pt": ["true"]}'
+  ```
+
+  Multiple adapters can be listed (one entry per list) and are applied additively; `scale` controls each adapter's strength.
 
   ## Wan LoRA
 

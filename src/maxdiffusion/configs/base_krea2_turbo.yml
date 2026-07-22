@@ -242,6 +242,24 @@ lightning_repo: ""
 lightning_ckpt: ""
 
 # LoRA parameters
+# Applies externally-trained LoRA adapters (.safetensors) to the Krea 2
+# transformer at inference. Supported key formats: kohya/ComfyUI
+# (lora_down/lora_up + alpha, plus diff/diff_b) and diffusers/PEFT
+# (lora_A/lora_B). Text-encoder LoRA keys are ignored with a warning.
+# Each list entry describes one adapter:
+#   lora_model_name_or_path: local .safetensors path, local directory, or HF Hub repo id
+#   weight_name: file name inside the directory/repo (may repeat the file name for a direct path)
+#   adapter_name: unique name for this adapter
+#   scale: adapter strength multiplier (1.0 = as trained)
+#   from_pt: accepted for config compatibility; LoRA files are always torch-format
+# Example:
+# lora_config: {
+#   lora_model_name_or_path: ["/path/to/my_krea2_lora.safetensors"],
+#   weight_name: ["my_krea2_lora.safetensors"],
+#   adapter_name: ["my-style"],
+#   scale: [0.8],
+#   from_pt: ["true"]
+# }
 lora_config: {
   lora_model_name_or_path: [],
   weight_name: [],

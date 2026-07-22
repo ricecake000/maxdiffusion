@@ -27,6 +27,7 @@ import json
 import math
 import os
 import time
+from contextlib import ExitStack
 from typing import List
 
 from absl import app
@@ -140,6 +141,11 @@ def main(argv):
   from maxdiffusion.models.flux.util import cast_dict_to_bfloat16_inplace
   from maxdiffusion.schedulers.scheduling_flow_match_flax import FlaxFlowMatchScheduler
   from maxdiffusion.pipelines.krea2.krea2_pipeline import FlaxKrea2Pipeline
+  from maxdiffusion.loaders.krea2_lora_pipeline import (
+      apply_diff_updates,
+      insert_lora_params,
+      maybe_load_krea2_lora,
+  )
 
   config = pyconfig.config
   os.makedirs(config.output_dir, exist_ok=True)
@@ -265,6 +271,12 @@ def main(argv):
       weights_dtype=config.weights_dtype,
   )
 
+  # 5b. Optionally load LoRA adapters (kohya/ComfyUI/diffusers .safetensors).
+  # The interceptors must be live around shape evaluation AND every pipeline
+  # call so the abstract param tree (and the jit traces) include the lora-*
+  # subtrees; with no adapters configured this is a single no-op interceptor.
+  lora_flat_params, lora_interceptors, lora_diff_updates = maybe_load_krea2_lora(config, config.weights_dtype)
+
   # 6. Evaluate shapes & extract mesh shardings
   max_logging.log("Evaluating model shapes and shardings...")
   # Height/width must be multiples of 16 (VAE 8x downsampling x 2x2 latent
@@ -318,15 +330,18 @@ def main(argv):
   def qwen3_init_fn():
     return qwen3_model.init(qwen_key, qwen_ids_dummy, qwen_mask_dummy)
 
-  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-    abstract_transformer_vars = jax.eval_shape(transformer_init_fn)
-    abstract_qwen3_vars = jax.eval_shape(qwen3_init_fn)
+  with ExitStack() as stack:
+    for interceptor in lora_interceptors:
+      stack.enter_context(nn.intercept_methods(interceptor))
+    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      abstract_transformer_vars = jax.eval_shape(transformer_init_fn)
+      abstract_qwen3_vars = jax.eval_shape(qwen3_init_fn)
 
-    logical_transformer_specs = nn.get_partition_spec(abstract_transformer_vars)
-    logical_qwen3_specs = nn.get_partition_spec(abstract_qwen3_vars)
+      logical_transformer_specs = nn.get_partition_spec(abstract_transformer_vars)
+      logical_qwen3_specs = nn.get_partition_spec(abstract_qwen3_vars)
 
-    transformer_mesh_shardings = nn.logical_to_mesh_sharding(logical_transformer_specs, mesh, config.logical_axis_rules)
-    qwen3_mesh_shardings = nn.logical_to_mesh_sharding(logical_qwen3_specs, mesh, config.logical_axis_rules)
+      transformer_mesh_shardings = nn.logical_to_mesh_sharding(logical_transformer_specs, mesh, config.logical_axis_rules)
+      qwen3_mesh_shardings = nn.logical_to_mesh_sharding(logical_qwen3_specs, mesh, config.logical_axis_rules)
 
   transformer_shardings = flax.core.freeze(transformer_mesh_shardings["params"])
   qwen3_shardings = flax.core.freeze(qwen3_mesh_shardings["params"])
@@ -353,6 +368,10 @@ def main(argv):
       qwen3_params = flax.core.unfreeze(qwen3_params)
 
       params = load_and_convert_krea2_weights(transformer_path, params, num_layers)
+      # load_and_convert_krea2_weights zero-fills the lora-* leaves it doesn't
+      # recognize, so the real LoRA tensors must be written after it returns.
+      params = insert_lora_params(params, lora_flat_params)
+      params = apply_diff_updates(params, lora_diff_updates)
       qwen3_params = load_and_convert_qwen3_weights(
           text_encoder_path, qwen3_params, qwen3_config, key_prefix="model.language_model."
       )
@@ -435,13 +454,19 @@ def main(argv):
       output_dir=config.output_dir,
   )
 
-  max_logging.log("Running warmup pass (XLA compilation)...")
-  _, warmup_trace = pipeline(prompt=active_prompts, output_name="krea2_warmup.png", **call_kwargs)
-  warmup_time = sum(warmup_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
+  # One interceptor context spans both passes so every (re)trace of the jitted
+  # transformer step sees the LoRA interceptors.
+  with ExitStack() as stack:
+    for interceptor in lora_interceptors:
+      stack.enter_context(nn.intercept_methods(interceptor))
 
-  max_logging.log("Running timed pass at full device speed...")
-  _, main_trace = pipeline(prompt=active_prompts, output_name=config.output_name, **call_kwargs)
-  main_time = sum(main_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
+    max_logging.log("Running warmup pass (XLA compilation)...")
+    _, warmup_trace = pipeline(prompt=active_prompts, output_name="krea2_warmup.png", **call_kwargs)
+    warmup_time = sum(warmup_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
+
+    max_logging.log("Running timed pass at full device speed...")
+    _, main_trace = pipeline(prompt=active_prompts, output_name=config.output_name, **call_kwargs)
+    main_time = sum(main_trace.get(k, 0.0) for k in ("prompt_encoding", "denoise_loop", "vae_decode"))
 
   max_logging.log("=" * 80)
   max_logging.log("KREA 2 LATENCY & TIMING BREAKDOWN")
