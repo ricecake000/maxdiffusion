@@ -40,8 +40,10 @@ from ...models.krea2.util import (
     KREA2_PROMPT_TEMPLATE_SUFFIX,
     KREA2_TEXT_ENCODER_SELECT_LAYERS,
     calculate_krea2_shift,
+    mask_is_batch_uniform,
     prepare_krea2_image_ids,
     prepare_krea2_text_ids,
+    round_up_to_multiple,
 )
 from ...models.flux.util import pack_latents, unpack_latents
 from ...models.qwen3_flax import FlaxQwen3Model
@@ -207,6 +209,19 @@ class FlaxKrea2Pipeline:
     else:
       negative_prompts = negative_prompt
 
+    # The VAE downsamples 8x and latents are packed into 2x2 patches, so height
+    # and width must be multiples of 16. Round up (with a warning) like the
+    # diffusers reference pipeline instead of silently flooring.
+    multiple = 16
+    if height % multiple != 0 or width % multiple != 0:
+      rounded_height = round_up_to_multiple(height, multiple)
+      rounded_width = round_up_to_multiple(width, multiple)
+      max_logging.log(
+          f"Warning: height and width must be multiples of {multiple}; rounding up from "
+          f"{height}x{width} to {rounded_height}x{rounded_width}."
+      )
+      height, width = rounded_height, rounded_width
+
     grid_height = height // 16
     grid_width = width // 16
     seq_len_img = grid_height * grid_width
@@ -256,6 +271,21 @@ class FlaxKrea2Pipeline:
       if do_classifier_free_guidance:
         negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(negative_prompts, qwen3_params)
       prompt_embeds.block_until_ready()
+
+      # The repo's flash-attention kernels share the key-padding mask of batch
+      # element 0 across the whole batch (_build_padding_segment_ids). Refuse to
+      # continue if that would silently miscompute the other batch elements.
+      attention_kernel = getattr(self.transformer, "attention_kernel", "dot_product")
+      if attention_kernel != "dot_product" and batch_size > 1:
+        masks_uniform = mask_is_batch_uniform(prompt_embeds_mask)
+        if do_classifier_free_guidance:
+          masks_uniform = masks_uniform and mask_is_batch_uniform(negative_prompt_embeds_mask)
+        if not masks_uniform:
+          raise ValueError(
+              f"attention='{attention_kernel}' shares the text padding mask of batch element 0 across the "
+              "whole batch, but the prompts in this batch tokenize to different padding masks. "
+              "Use identical prompts per batch, batch_size=1, or attention='dot_product'."
+          )
 
       trace["prompt_encoding"] = time.perf_counter() - t0
       max_logging.log(f" -> [TIMING] Prompt Encoding (Qwen3-VL): {trace['prompt_encoding']:.4f} seconds")
@@ -351,20 +381,23 @@ class FlaxKrea2Pipeline:
     else:
       images_numpy = np.array(images)
 
+    # Only process 0 writes files: on multihost every process holds the full
+    # gathered batch, and concurrent writes to a shared filesystem would race.
     saved_paths = []
-    for b_idx in range(batch_size):
-      image_np = np.array(images_numpy[b_idx] * 255.0, dtype=np.uint8)
-      if image_np.shape[0] == 3:
-        image_np = image_np.transpose(1, 2, 0)
-      img = Image.fromarray(image_np)
+    if jax.process_index() == 0:
+      for b_idx in range(batch_size):
+        image_np = np.array(images_numpy[b_idx] * 255.0, dtype=np.uint8)
+        if image_np.shape[0] == 3:
+          image_np = image_np.transpose(1, 2, 0)
+        img = Image.fromarray(image_np)
 
-      if batch_size > 1:
-        batch_output_name = output_name.replace(".png", f"_b{b_idx}.png")
-      else:
-        batch_output_name = output_name
-      output_png_path = os.path.join(output_dir, batch_output_name)
-      img.save(output_png_path)
-      max_logging.log(f" -> Saved image: {output_png_path} | Prompt: '{prompts[b_idx]}'")
-      saved_paths.append(output_png_path)
+        if batch_size > 1:
+          batch_output_name = output_name.replace(".png", f"_b{b_idx}.png")
+        else:
+          batch_output_name = output_name
+        output_png_path = os.path.join(output_dir, batch_output_name)
+        img.save(output_png_path)
+        max_logging.log(f" -> Saved image: {output_png_path} | Prompt: '{prompts[b_idx]}'")
+        saved_paths.append(output_png_path)
 
     return saved_paths, trace
