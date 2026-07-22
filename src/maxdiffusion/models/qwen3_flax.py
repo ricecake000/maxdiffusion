@@ -136,11 +136,16 @@ def apply_qwen3_rotary_pos_emb(
   Applies RoPE to Q and K tensors.
   q shape: (batch, seq_len, num_heads, head_dim)
   k shape: (batch, seq_len, num_kv_heads, head_dim)
-  cos, sin shape: (seq_len, head_dim)
+  cos, sin shape: (seq_len, head_dim) or (batch, seq_len, head_dim)
   """
-  # Reshape cos/sin to (1, seq_len, 1, head_dim) for broadcasting
-  cos = cos[jnp.newaxis, :, jnp.newaxis, :]
-  sin = sin[jnp.newaxis, :, jnp.newaxis, :]
+  if cos.ndim == 3:
+    # Per-batch positions: (batch, seq_len, head_dim) -> (batch, seq_len, 1, head_dim)
+    cos = cos[:, :, jnp.newaxis, :]
+    sin = sin[:, :, jnp.newaxis, :]
+  else:
+    # Reshape cos/sin to (1, seq_len, 1, head_dim) for broadcasting
+    cos = cos[jnp.newaxis, :, jnp.newaxis, :]
+    sin = sin[jnp.newaxis, :, jnp.newaxis, :]
 
   def rotate_half(x):
     half = x.shape[-1] // 2
@@ -168,6 +173,7 @@ class FlaxQwen3Attention(nn.Module):
       attention_mask: Optional[jnp.ndarray] = None,
       cos_table: Optional[jnp.ndarray] = None,
       sin_table: Optional[jnp.ndarray] = None,
+      position_ids: Optional[jnp.ndarray] = None,
   ):
     batch_size, seq_len, _ = x.shape
 
@@ -231,9 +237,15 @@ class FlaxQwen3Attention(nn.Module):
 
     # 3. Apply RoPE
     if cos_table is not None and sin_table is not None:
-      # Extract cos/sin for the current sequence length
-      cos = cos_table[:seq_len, :]
-      sin = sin_table[:seq_len, :]
+      if position_ids is not None:
+        # Gather per-token positions: (batch, seq_len, head_dim). Used by Krea 2,
+        # whose prompt template pads mid-sequence so positions count only valid tokens.
+        cos = cos_table[position_ids]
+        sin = sin_table[position_ids]
+      else:
+        # Extract cos/sin for the current sequence length
+        cos = cos_table[:seq_len, :]
+        sin = sin_table[:seq_len, :]
       q, k = apply_qwen3_rotary_pos_emb(q, k, cos, sin)
 
     # 4. Repeat KV heads to match Query heads (GQA)
@@ -287,6 +299,7 @@ class FlaxQwen3DecoderLayer(nn.Module):
       attention_mask: Optional[jnp.ndarray] = None,
       cos_table: Optional[jnp.ndarray] = None,
       sin_table: Optional[jnp.ndarray] = None,
+      position_ids: Optional[jnp.ndarray] = None,
   ):
     # input_layernorm
     input_layernorm = FlaxQwen3RMSNorm(
@@ -319,6 +332,7 @@ class FlaxQwen3DecoderLayer(nn.Module):
         attention_mask=attention_mask,
         cos_table=cos_table,
         sin_table=sin_table,
+        position_ids=position_ids,
     )
     x = x + attn_out
 
@@ -342,9 +356,16 @@ class FlaxQwen3Model(nn.Module):
       self,
       input_ids: jnp.ndarray,
       attention_mask: Optional[jnp.ndarray] = None,
+      position_ids: Optional[jnp.ndarray] = None,
   ) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
     """
     Runs the full Qwen3-4B model.
+
+    Args:
+        input_ids: (batch, seq_len) token ids.
+        attention_mask: optional (batch, seq_len) padding mask.
+        position_ids: optional (batch, seq_len) per-token rotary positions. When
+            omitted, positions default to `arange(seq_len)`.
     Returns:
         last_hidden_state: Output of the final layer (batch, seq_len, 2560)
         all_hidden_states: List of activations from every layer, including token embeddings (length 37)
@@ -384,6 +405,7 @@ class FlaxQwen3Model(nn.Module):
           attention_mask=attention_mask,
           cos_table=cos_table,
           sin_table=sin_table,
+          position_ids=position_ids,
       )
       all_hidden_states.append(hidden_states)
 
@@ -626,9 +648,18 @@ class NNXFlaxQwen3Model(nnx.Module):
 # -----------------------------------------------------------------------------
 
 
-def load_and_convert_qwen3_weights(safetensors_path: str, jax_params: dict, config: FlaxQwen3Config) -> dict:
+def load_and_convert_qwen3_weights(
+    safetensors_path: str, jax_params: dict, config: FlaxQwen3Config, key_prefix: str = "model."
+) -> dict:
   """
   Loads weights from safetensors via zero-copy safetensors.numpy and converts them to JAX parameter dictionary.
+
+  Args:
+      key_prefix: prefix of the decoder weights inside the checkpoint. Plain Qwen3
+          checkpoints use "model." (default). Qwen3-VL checkpoints (e.g. the Krea 2
+          text encoder) store the text tower under "model.language_model." or
+          "language_model."; vision-tower weights are ignored. If the given prefix
+          is not found, common alternatives are auto-detected.
   """
   import glob
   import os
@@ -647,6 +678,14 @@ def load_and_convert_qwen3_weights(safetensors_path: str, jax_params: dict, conf
     max_logging.log(f"Loading Qwen3 weights from file: {safetensors_path}...")
     torch_weights = load_file(safetensors_path)
   max_logging.log("Safetensors weights loaded successfully. Starting JAX parameter mapping...")
+
+  # Auto-detect the decoder key prefix if the requested one is absent.
+  if f"{key_prefix}embed_tokens.weight" not in torch_weights:
+    for candidate in ("model.", "model.language_model.", "language_model.", ""):
+      if f"{candidate}embed_tokens.weight" in torch_weights:
+        max_logging.log(f"Qwen3 key prefix '{key_prefix}' not found; using detected prefix '{candidate}'.")
+        key_prefix = candidate
+        break
 
   # Helper to transpose and cast weight
   def get_w(name: str, transpose: bool = True) -> np.ndarray:
@@ -670,40 +709,40 @@ def load_and_convert_qwen3_weights(safetensors_path: str, jax_params: dict, conf
 
     # 1. Token Embeddings
     if k[0] == "embed_tokens" and k[1] == "embedding":
-      converted_flat[k] = get_w("model.embed_tokens.weight", transpose=False)
+      converted_flat[k] = get_w(f"{key_prefix}embed_tokens.weight", transpose=False)
 
     # 2. Decoder Layer Normalizations (RMSNorm)
     elif "input_layernorm" in path_str and k[-1] == "weight":
       layer_idx = k[0].split("_")[1]
-      converted_flat[k] = get_w(f"model.layers.{layer_idx}.input_layernorm.weight")
+      converted_flat[k] = get_w(f"{key_prefix}layers.{layer_idx}.input_layernorm.weight")
 
     elif "post_attention_layernorm" in path_str and k[-1] == "weight":
       layer_idx = k[0].split("_")[1]
-      converted_flat[k] = get_w(f"model.layers.{layer_idx}.post_attention_layernorm.weight")
+      converted_flat[k] = get_w(f"{key_prefix}layers.{layer_idx}.post_attention_layernorm.weight")
 
     # 3. Attention Projections & QK-Norm
     elif "self_attn" in path_str and k[-1] == "kernel":
       layer_idx = k[0].split("_")[1]
       proj_name = k[2]  # q_proj, k_proj, v_proj, o_proj
-      converted_flat[k] = get_w(f"model.layers.{layer_idx}.self_attn.{proj_name}.weight")
+      converted_flat[k] = get_w(f"{key_prefix}layers.{layer_idx}.self_attn.{proj_name}.weight")
 
     elif "self_attn" in path_str and "q_norm" in path_str and k[-1] == "weight":
       layer_idx = k[0].split("_")[1]
-      converted_flat[k] = get_w(f"model.layers.{layer_idx}.self_attn.q_norm.weight")
+      converted_flat[k] = get_w(f"{key_prefix}layers.{layer_idx}.self_attn.q_norm.weight")
 
     elif "self_attn" in path_str and "k_norm" in path_str and k[-1] == "weight":
       layer_idx = k[0].split("_")[1]
-      converted_flat[k] = get_w(f"model.layers.{layer_idx}.self_attn.k_norm.weight")
+      converted_flat[k] = get_w(f"{key_prefix}layers.{layer_idx}.self_attn.k_norm.weight")
 
     # 4. MLP Block
     elif "mlp" in path_str and k[-1] == "kernel":
       layer_idx = k[0].split("_")[1]
       proj_name = k[2]  # gate_proj, up_proj, down_proj
-      converted_flat[k] = get_w(f"model.layers.{layer_idx}.mlp.{proj_name}.weight")
+      converted_flat[k] = get_w(f"{key_prefix}layers.{layer_idx}.mlp.{proj_name}.weight")
 
     # 5. Final RMSNorm
     elif k[0] == "norm" and k[1] == "weight":
-      converted_flat[k] = get_w("model.norm.weight")
+      converted_flat[k] = get_w(f"{key_prefix}norm.weight")
 
     else:
       max_logging.log(f"WARNING: JAX parameter '{path_str}' did not match any PyTorch weights!")

@@ -17,6 +17,7 @@
 [![Unit Tests](https://github.com/AI-Hypercomputer/maxdiffusion/actions/workflows/UnitTests.yml/badge.svg)](https://github.com/AI-Hypercomputer/maxdiffusion/actions/workflows/UnitTests.yml)
 
 # What's new?
+- **`2026/07/22`**: Krea 2 (Raw & Turbo) text2img inference is now supported.
 - **`2026/07/14`**: Automatic attention tile-size (`block_q`/`block_kv`) search for Wan is now supported.
 - **`2026/06/26`**: 2D ring (USP) attention with a custom splash kernel is now supported for Wan (`ulysses_ring_custom`), splitting context parallelism into an intra-chip Ulysses axis and a cross-chip ring axis.
 - **`2026/04/16`**: Support for Tokamax Ring Attention kernel is now added.
@@ -58,6 +59,7 @@ MaxDiffusion supports
 * LTX-2 Video text2vid (inference).
 * Wan2.1 text2vid (training and inference).
 * Wan2.2 text2vid (inference).
+* Krea 2 Raw & Turbo text2img (inference).
 
 **Note on GPU Support:** GPU support is not actively maintained, but contributions are welcome
 
@@ -83,6 +85,7 @@ MaxDiffusion supports
     - [LTX-2 Video](#ltx-2-video)
     - [Flux](#flux)
       - [Fused Attention for GPU](#fused-attention-for-gpu)
+    - [Krea 2](#krea-2)
     - [SDXL](#stable-diffusion-xl)
     - [SD 2 base](#stable-diffusion-2-base)
     - [SD 2.1](#stable-diffusion-21)
@@ -787,6 +790,27 @@ The optimal attention tile sizes (`block_q` / `block_kv`) depend on the sequence
   ```bash
   NVTE_FUSED_ATTN=1 HF_HUB_ENABLE_HF_TRANSFER=1 python src/maxdiffusion/generate_flux.py src/maxdiffusion/configs/base_flux_dev.yml jax_cache_dir=/tmp/cache_dir run_name=flux_test output_dir=/tmp/ prompt='A cute corgi lives in a house made out of sushi, anime' num_inference_steps=28 split_head_dim=True per_device_batch_size=1 attention="cudnn_flash_te" hardware=gpu
   ```
+  ## Krea 2
+
+  Krea 2 (K2) is a 12.9B single-stream MMDiT text2img model conditioned on Qwen3-VL-4B text embeddings and decoded with the Qwen-Image (Wan 2.1 architecture) VAE. Two open-weight checkpoints are supported:
+
+  - `krea/Krea-2-Raw` — base (midtrain) checkpoint: 28 steps with classifier-free guidance (`guidance_scale=4.5`, Krea convention `cond + g * (cond - uncond)`).
+  - `krea/Krea-2-Turbo` — few-step distilled (TDM) checkpoint: 8 steps with guidance disabled.
+
+  Krea 2 Raw:
+
+  ```bash
+  python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2.yml jax_cache_dir=/tmp/cache_dir run_name=krea2_raw output_dir=output/ prompt="a fox in the snow"
+  ```
+
+  Krea 2 Turbo:
+
+  ```bash
+  python src/maxdiffusion/generate_krea2.py src/maxdiffusion/configs/base_krea2_turbo.yml jax_cache_dir=/tmp/cache_dir run_name=krea2_turbo output_dir=output/ prompt="a fox in the snow"
+  ```
+
+  The bf16 transformer weighs ~26GB, so single-chip runs are not possible; the default config shards the model with FSDP across all devices (and falls back to tensor parallelism for `batch_size=1`). Note: with `attention: 'flash'`, per-batch text padding masks are shared from batch element 0 — use `batch_size=1` (default), identical prompts per batch, or `attention: 'dot_product'` when batching different prompts.
+
   ## Wan LoRA
 
   Disclaimer: not all LoRA formats have been tested. Currently supports ComfyUI and AI Toolkit formats. If there is a specific LoRA that doesn't load, please let us know.
