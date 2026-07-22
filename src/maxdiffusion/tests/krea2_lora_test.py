@@ -356,6 +356,18 @@ class MetadataAlphaConverterTest(unittest.TestCase):
     self.assertEqual(alphas[("blocks_0", "attn", "to_q")], 8.0)
     self.assertEqual(alphas[("blocks_0", "ff", "gate_proj")], 32.0)
 
+  def test_alpha_pattern_uses_peft_regex_semantics(self):
+    lora_meta = {
+        "lora_alpha": 32.0,
+        "use_rslora": False,
+        "alpha_pattern": {r"^transformer_blocks\.\d+\.attn\.to_q": 8.0, "q": 4.0},
+    }
+    _, _, alphas, _ = convert_krea2_lora_to_flax(
+        self._peft_state_dict(np.random.RandomState(0)), "test", lora_meta=lora_meta
+    )
+    self.assertEqual(alphas[("blocks_0", "attn", "to_q")], 8.0)
+    self.assertEqual(alphas[("blocks_0", "ff", "gate_proj")], 32.0)
+
   def test_explicit_alpha_tensor_wins_over_metadata(self):
     rng = np.random.RandomState(0)
     state_dict = {
@@ -416,6 +428,180 @@ class LoraStateDictLoadingTest(unittest.TestCase):
         Krea2LoraLoaderMixin.lora_state_dict(tmpdir)
       state_dict, _, _ = Krea2LoraLoaderMixin.lora_state_dict(tmpdir, weight_name="b.safetensors")
       self.assertEqual(len(state_dict), 2)
+
+  def test_hub_options_and_nested_adapter_config_are_used(self):
+    import json
+    import sys
+    import tempfile
+    import types
+    from unittest import mock
+
+    class EntryNotFoundError(Exception):
+      pass
+
+    download_calls = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+      config_path = os.path.join(tmpdir, "adapter_config.json")
+      with open(config_path, "w") as f:
+        json.dump({"lora_alpha": 16}, f)
+
+      def fake_hf_hub_download(
+          repo_id,
+          filename,
+          *,
+          subfolder=None,
+          revision=None,
+          cache_dir=None,
+          force_download=False,
+          local_files_only=False,
+          token=None,
+          user_agent=None,
+          proxies=None,
+          resume_download=None,
+      ):
+        download_calls.append(
+            {
+                "repo_id": repo_id,
+                "filename": filename,
+                "subfolder": subfolder,
+                "revision": revision,
+                "cache_dir": cache_dir,
+                "force_download": force_download,
+                "local_files_only": local_files_only,
+                "token": token,
+                "user_agent": user_agent,
+                "proxies": proxies,
+                "resume_download": resume_download,
+            }
+        )
+        return config_path if filename == "adapter_config.json" else os.path.join(tmpdir, "adapter.safetensors")
+
+      fake_hub = types.ModuleType("huggingface_hub")
+      fake_hub.hf_hub_download = fake_hf_hub_download
+      fake_utils = types.ModuleType("huggingface_hub.utils")
+      fake_utils.EntryNotFoundError = EntryNotFoundError
+      with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub, "huggingface_hub.utils": fake_utils}):
+        with mock.patch(
+            "maxdiffusion.loaders.krea2_lora_pipeline._load_safetensors_with_metadata",
+            return_value=({"weight": object()}, {"metadata": "present"}),
+        ):
+          _, metadata, adapter_config = Krea2LoraLoaderMixin.lora_state_dict(
+              "org/repo",
+              weight_name="nested/adapter.safetensors",
+              subfolder="collection",
+              revision="v1",
+              cache_dir="/cache",
+              force_download=True,
+              local_files_only=True,
+              use_auth_token="secret",
+              proxies={"https": "proxy"},
+              resume_download=True,
+          )
+
+    self.assertEqual(metadata, {"metadata": "present"})
+    self.assertEqual(adapter_config["lora_alpha"], 16)
+    self.assertEqual(download_calls[0]["filename"], "nested/adapter.safetensors")
+    self.assertEqual(download_calls[0]["subfolder"], "collection")
+    self.assertEqual(download_calls[1]["filename"], "adapter_config.json")
+    self.assertEqual(download_calls[1]["subfolder"], "collection/nested")
+    for call in download_calls:
+      self.assertEqual(call["revision"], "v1")
+      self.assertEqual(call["cache_dir"], "/cache")
+      self.assertTrue(call["force_download"])
+      self.assertTrue(call["local_files_only"])
+      self.assertEqual(call["token"], "secret")
+      self.assertEqual(call["proxies"], {"https": "proxy"})
+      self.assertTrue(call["resume_download"])
+
+  def test_hub_auto_selection_uses_cached_snapshot_when_offline(self):
+    import json
+    import sys
+    import tempfile
+    import types
+    from unittest import mock
+
+    class EntryNotFoundError(Exception):
+      pass
+
+    snapshot_calls = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+      adapter_dir = os.path.join(tmpdir, "adapters")
+      os.makedirs(adapter_dir)
+      adapter_path = os.path.join(adapter_dir, "adapter.safetensors")
+      with open(adapter_path, "w"):
+        pass
+      with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
+        json.dump({"lora_alpha": 24}, f)
+
+      def fake_hf_hub_download(
+          repo_id,
+          filename,
+          *,
+          subfolder=None,
+          revision=None,
+          cache_dir=None,
+          force_download=False,
+          local_files_only=False,
+          token=None,
+          user_agent=None,
+      ):
+        raise AssertionError("offline auto-selection must not call hf_hub_download")
+
+      class FakeHfApi:
+
+        def snapshot_download(
+            self,
+            repo_id,
+            *,
+            revision=None,
+            cache_dir=None,
+            force_download=False,
+            local_files_only=False,
+            token=None,
+            allow_patterns=None,
+        ):
+          snapshot_calls.append(
+              {
+                  "repo_id": repo_id,
+                  "revision": revision,
+                  "cache_dir": cache_dir,
+                  "force_download": force_download,
+                  "local_files_only": local_files_only,
+                  "token": token,
+                  "allow_patterns": allow_patterns,
+              }
+          )
+          return tmpdir
+
+        def list_repo_files(self, *args, **kwargs):
+          raise AssertionError("offline auto-selection must not list remote files")
+
+      fake_hub = types.ModuleType("huggingface_hub")
+      fake_hub.hf_hub_download = fake_hf_hub_download
+      fake_hub.HfApi = FakeHfApi
+      fake_utils = types.ModuleType("huggingface_hub.utils")
+      fake_utils.EntryNotFoundError = EntryNotFoundError
+      with mock.patch.dict(sys.modules, {"huggingface_hub": fake_hub, "huggingface_hub.utils": fake_utils}):
+        with mock.patch(
+            "maxdiffusion.loaders.krea2_lora_pipeline._load_safetensors_with_metadata",
+            return_value=({"weight": object()}, {}),
+        ) as load_mock:
+          _, _, adapter_config = Krea2LoraLoaderMixin.lora_state_dict(
+              "org/repo",
+              subfolder="adapters",
+              revision="v2",
+              cache_dir="/cache",
+              local_files_only=True,
+              token="secret",
+          )
+
+    load_mock.assert_called_once_with(adapter_path)
+    self.assertEqual(adapter_config["lora_alpha"], 24)
+    self.assertEqual(snapshot_calls[0]["repo_id"], "org/repo")
+    self.assertEqual(snapshot_calls[0]["revision"], "v2")
+    self.assertEqual(snapshot_calls[0]["cache_dir"], "/cache")
+    self.assertTrue(snapshot_calls[0]["local_files_only"])
+    self.assertEqual(snapshot_calls[0]["token"], "secret")
 
   def test_incompatible_adapter_fails_loudly(self):
     import tempfile
@@ -584,6 +770,12 @@ class DiffMergeTest(unittest.TestCase):
         0.5 * state_dict["lora_unet_final_layer_linear.diff_b"],
         rtol=1e-6,
     )
+
+  def test_all_missing_diff_targets_fail_loudly(self):
+    params = {"final_layer": {"linear": {"kernel": jnp.zeros((2, 2), jnp.float32)}}}
+    diffs = {("blocks_999", "attn", "to_q", "kernel"): jnp.zeros((2, 2), jnp.float32)}
+    with self.assertRaisesRegex(ValueError, "None of the LoRA diff targets exist"):
+      apply_diff_updates(params, diffs)
 
 
 if __name__ == "__main__":
