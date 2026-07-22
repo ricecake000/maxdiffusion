@@ -309,7 +309,11 @@ def _resolve_network_alpha(torch_path, rank, explicit_alpha, lora_meta):
     return None
   alpha = None
   for pattern, pattern_alpha in lora_meta.get("alpha_pattern", {}).items():
-    if pattern in torch_path:
+    # Match PEFT's get_pattern_key semantics: patterns are regular
+    # expressions matched against the complete module path, with an optional
+    # dotted prefix. A substring check silently misses anchored/escaped
+    # patterns and can over-match similarly named modules.
+    if re.match(rf"(.*\.)?({pattern})$", torch_path):
       alpha = float(pattern_alpha)
       break
   if alpha is None:

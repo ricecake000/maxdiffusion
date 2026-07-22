@@ -18,8 +18,10 @@
 # adds the low-rank update to every intercepted `Dense.__call__`.
 
 import glob
+import inspect
 import json
 import os
+import posixpath
 from typing import Dict, Union
 
 import jax.numpy as jnp
@@ -31,6 +33,7 @@ from ..models.lora import BaseLoRALayer, LoRALinearLayer
 from .lora_base import LoRABaseMixin
 
 PEFT_ADAPTER_CONFIG_NAME = "adapter_config.json"
+_HF_USER_AGENT = {"file_type": "attn_procs_weights", "framework": "pytorch"}
 
 
 def _load_safetensors_with_metadata(file_path):
@@ -81,35 +84,106 @@ class Krea2LoraLoaderMixin(LoRABaseMixin):
       return pretrained_model_name_or_path_or_dict, {}, None
 
     path = pretrained_model_name_or_path_or_dict
+    subfolder = kwargs.get("subfolder")
     if os.path.isfile(path):
       file_path = path
     elif os.path.isdir(path):
+      search_dir = os.path.join(path, subfolder) if subfolder else path
       if weight_name:
-        file_path = os.path.join(path, weight_name)
+        file_path = os.path.join(search_dir, weight_name)
         if not os.path.isfile(file_path):
-          raise ValueError(f"LoRA weight file {weight_name} not found in directory {path}.")
+          raise ValueError(f"LoRA weight file {weight_name} not found in directory {search_dir}.")
       else:
-        file_path = cls._resolve_single_safetensors(glob.glob(os.path.join(path, "*.safetensors")), f"directory {path}")
+        file_path = cls._resolve_single_safetensors(
+            glob.glob(os.path.join(search_dir, "*.safetensors")), f"directory {search_dir}"
+        )
     else:
       # HF Hub repo id.
       from huggingface_hub import hf_hub_download
       from huggingface_hub.utils import EntryNotFoundError
 
       revision = kwargs.pop("revision", None)
+      subfolder = kwargs.pop("subfolder", None)
+      token = kwargs.pop("token", None)
+      use_auth_token = kwargs.pop("use_auth_token", None)
+      if token is None:
+        token = use_auth_token
+      download_kwargs = {
+          "revision": revision,
+          "cache_dir": kwargs.pop("cache_dir", None),
+          "force_download": kwargs.pop("force_download", False),
+          "local_files_only": kwargs.pop("local_files_only", False),
+          "token": token,
+          "user_agent": _HF_USER_AGENT,
+      }
+      # huggingface_hub 0.x accepts these legacy options, while newer
+      # releases removed them. Forward them only when the installed version
+      # still exposes the corresponding parameters.
+      download_parameters = inspect.signature(hf_hub_download).parameters
+      accepts_extra_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in download_parameters.values())
+      for option in ("proxies", "resume_download"):
+        if option in kwargs:
+          value = kwargs.pop(option)
+          if option in download_parameters or accepts_extra_kwargs:
+            download_kwargs[option] = value
+
       if not weight_name:
         from huggingface_hub import HfApi
 
-        repo_files = HfApi().list_repo_files(path, revision=revision)
+        hub_api = HfApi()
+        if download_kwargs["local_files_only"]:
+          snapshot_parameters = inspect.signature(hub_api.snapshot_download).parameters
+          snapshot_kwargs = {
+              key: value
+              for key, value in download_kwargs.items()
+              if key in snapshot_parameters and key != "user_agent"
+          }
+          snapshot_kwargs["allow_patterns"] = [
+              "*.safetensors",
+              "**/*.safetensors",
+              "adapter_config.json",
+              "**/adapter_config.json",
+          ]
+          snapshot_dir = hub_api.snapshot_download(repo_id=path, **snapshot_kwargs)
+          search_dir = os.path.join(snapshot_dir, subfolder) if subfolder else snapshot_dir
+          file_path = cls._resolve_single_safetensors(
+              glob.glob(os.path.join(search_dir, "**", "*.safetensors"), recursive=True),
+              f"cached HF Hub repo {path}" + (f" subfolder {subfolder}" if subfolder else ""),
+          )
+          state_dict, metadata = _load_safetensors_with_metadata(file_path)
+          return state_dict, metadata, _maybe_read_adapter_config(os.path.dirname(os.path.abspath(file_path)))
+
+        repo_files = hub_api.list_repo_files(path, revision=revision, token=token)
+        prefix = f"{subfolder.strip('/')}/" if subfolder else ""
         weight_name = cls._resolve_single_safetensors(
-            [f for f in repo_files if f.endswith(".safetensors")], f"HF Hub repo {path}"
+            [f[len(prefix) :] for f in repo_files if f.startswith(prefix) and f.endswith(".safetensors")],
+            f"HF Hub repo {path}" + (f" subfolder {subfolder}" if subfolder else ""),
         )
-      file_path = hf_hub_download(repo_id=path, filename=weight_name, revision=revision)
-      try:
-        config_path = hf_hub_download(repo_id=path, filename=PEFT_ADAPTER_CONFIG_NAME, revision=revision)
-        with open(config_path, "r") as f:
-          adapter_config = json.load(f)
-      except EntryNotFoundError:
-        adapter_config = None
+      file_path = hf_hub_download(repo_id=path, filename=weight_name, subfolder=subfolder, **download_kwargs)
+
+      # PEFT stores adapter_config.json next to its weights. Try that location
+      # first, then the requested subfolder and repository root for legacy
+      # layouts.
+      weight_dir = posixpath.dirname(posixpath.join(subfolder or "", weight_name)) or None
+      requested_subfolder = subfolder.strip("/") if subfolder else None
+      config_subfolders = []
+      for candidate in (weight_dir, requested_subfolder, None):
+        if candidate not in config_subfolders:
+          config_subfolders.append(candidate)
+      adapter_config = None
+      for config_subfolder in config_subfolders:
+        try:
+          config_path = hf_hub_download(
+              repo_id=path,
+              filename=PEFT_ADAPTER_CONFIG_NAME,
+              subfolder=config_subfolder,
+              **download_kwargs,
+          )
+          with open(config_path, "r") as f:
+            adapter_config = json.load(f)
+          break
+        except EntryNotFoundError:
+          continue
       state_dict, metadata = _load_safetensors_with_metadata(file_path)
       return state_dict, metadata, adapter_config
 
@@ -186,6 +260,7 @@ def apply_diff_updates(params, diff_updates, scale=1.0):
   if not diff_updates:
     return params
   flat = flatten_dict(params)
+  applied_updates = 0
   for path, delta in diff_updates.items():
     if path not in flat:
       max_logging.log(f"WARNING: LoRA diff target {'.'.join(path)} not found in Krea 2 params; skipping.")
@@ -193,6 +268,12 @@ def apply_diff_updates(params, diff_updates, scale=1.0):
     leaf = flat[path]
     delta = jnp.asarray(delta).reshape(leaf.shape)
     flat[path] = (leaf + (delta * scale).astype(leaf.dtype)).astype(leaf.dtype)
+    applied_updates += 1
+  if applied_updates == 0:
+    raise ValueError(
+        "None of the LoRA diff targets exist in the Krea 2 parameter tree; "
+        "the adapter was likely trained for a different model."
+    )
   return unflatten_dict(flat)
 
 
