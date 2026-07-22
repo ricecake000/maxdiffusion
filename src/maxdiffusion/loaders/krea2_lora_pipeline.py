@@ -17,6 +17,8 @@
 # inside each target Dense's params, and an `nn.intercept_methods` interceptor
 # adds the low-rank update to every intercepted `Dense.__call__`.
 
+import glob
+import json
 import os
 from typing import Dict, Union
 
@@ -24,48 +26,103 @@ import jax.numpy as jnp
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from .. import max_logging
-from ..models.krea2.lora_util import convert_krea2_lora_to_flax
+from ..models.krea2.lora_util import convert_krea2_lora_to_flax, parse_lora_metadata
 from ..models.lora import BaseLoRALayer, LoRALinearLayer
 from .lora_base import LoRABaseMixin
+
+PEFT_ADAPTER_CONFIG_NAME = "adapter_config.json"
+
+
+def _load_safetensors_with_metadata(file_path):
+  """Loads tensors AND the file-level metadata (safetensors.torch.load_file
+  discards the latter, which carries diffusers/PEFT/kohya scaling settings)."""
+  from safetensors import safe_open
+
+  state_dict = {}
+  with safe_open(file_path, framework="pt", device="cpu") as f:
+    metadata = f.metadata() or {}
+    for key in f.keys():
+      state_dict[key] = f.get_tensor(key)
+  return state_dict, metadata
+
+
+def _maybe_read_adapter_config(directory):
+  """Reads a PEFT adapter_config.json if one sits next to the weights."""
+  config_path = os.path.join(directory, PEFT_ADAPTER_CONFIG_NAME)
+  if os.path.isfile(config_path):
+    with open(config_path, "r") as f:
+      return json.load(f)
+  return None
 
 
 class Krea2LoraLoaderMixin(LoRABaseMixin):
   _lora_lodable_modules = ["transformer"]
 
   @classmethod
-  def lora_state_dict(cls, pretrained_model_name_or_path_or_dict: Union[str, Dict], weight_name=None, **kwargs):
-    if isinstance(pretrained_model_name_or_path_or_dict, dict):
-      return pretrained_model_name_or_path_or_dict
-
-    import safetensors.torch
-
-    path = pretrained_model_name_or_path_or_dict
-    if os.path.isfile(path):
-      return safetensors.torch.load_file(path, device="cpu")
-    if os.path.isdir(path) and weight_name and os.path.isfile(os.path.join(path, weight_name)):
-      return safetensors.torch.load_file(os.path.join(path, weight_name), device="cpu")
-
-    # Fall back to the shared HF Hub fetch (repo id + weight_name).
-    return cls._fetch_state_dict(
-        pretrained_model_name_or_path_or_dict=path,
-        weight_name=weight_name,
-        use_safetensors=True,
-        local_files_only=kwargs.pop("local_files_only", None),
-        cache_dir=kwargs.pop("cache_dir", None),
-        force_download=kwargs.pop("force_download", False),
-        resume_download=kwargs.pop("resume_download", False),
-        proxies=kwargs.pop("proxies", None),
-        use_auth_token=kwargs.pop("use_auth_token", None),
-        revision=kwargs.pop("revision", None),
-        subfolder=kwargs.pop("subfolder", None),
-        user_agent={"file_type": "attn_procs_weights", "framework": "pytorch"},
-        allow_pickle=True,
+  def _resolve_single_safetensors(cls, candidates, source):
+    if len(candidates) == 1:
+      return candidates[0]
+    if not candidates:
+      raise ValueError(f"No .safetensors file found in {source}.")
+    raise ValueError(
+        f"Multiple .safetensors files found in {source}: {sorted(candidates)}. "
+        "Set lora_config.weight_name to pick one."
     )
 
   @classmethod
+  def lora_state_dict(cls, pretrained_model_name_or_path_or_dict: Union[str, Dict], weight_name=None, **kwargs):
+    """Resolves the adapter weights to a state dict plus its scaling metadata.
+
+    Returns `(state_dict, sft_metadata, adapter_config)` where `sft_metadata`
+    is the safetensors file-level metadata dict and `adapter_config` a parsed
+    PEFT adapter_config.json (or None).
+    """
+    if isinstance(pretrained_model_name_or_path_or_dict, dict):
+      return pretrained_model_name_or_path_or_dict, {}, None
+
+    path = pretrained_model_name_or_path_or_dict
+    if os.path.isfile(path):
+      file_path = path
+    elif os.path.isdir(path):
+      if weight_name:
+        file_path = os.path.join(path, weight_name)
+        if not os.path.isfile(file_path):
+          raise ValueError(f"LoRA weight file {weight_name} not found in directory {path}.")
+      else:
+        file_path = cls._resolve_single_safetensors(glob.glob(os.path.join(path, "*.safetensors")), f"directory {path}")
+    else:
+      # HF Hub repo id.
+      from huggingface_hub import hf_hub_download
+      from huggingface_hub.utils import EntryNotFoundError
+
+      revision = kwargs.pop("revision", None)
+      if not weight_name:
+        from huggingface_hub import HfApi
+
+        repo_files = HfApi().list_repo_files(path, revision=revision)
+        weight_name = cls._resolve_single_safetensors(
+            [f for f in repo_files if f.endswith(".safetensors")], f"HF Hub repo {path}"
+        )
+      file_path = hf_hub_download(repo_id=path, filename=weight_name, revision=revision)
+      try:
+        config_path = hf_hub_download(repo_id=path, filename=PEFT_ADAPTER_CONFIG_NAME, revision=revision)
+        with open(config_path, "r") as f:
+          adapter_config = json.load(f)
+      except EntryNotFoundError:
+        adapter_config = None
+      state_dict, metadata = _load_safetensors_with_metadata(file_path)
+      return state_dict, metadata, adapter_config
+
+    state_dict, metadata = _load_safetensors_with_metadata(file_path)
+    return state_dict, metadata, _maybe_read_adapter_config(os.path.dirname(os.path.abspath(file_path)))
+
+  @classmethod
   def load_lora_weights(cls, pretrained_model_name_or_path_or_dict, weight_name, adapter_name, weights_dtype, **kwargs):
-    state_dict = cls.lora_state_dict(pretrained_model_name_or_path_or_dict, weight_name=weight_name, **kwargs)
-    return convert_krea2_lora_to_flax(state_dict, adapter_name, weights_dtype)
+    state_dict, sft_metadata, adapter_config = cls.lora_state_dict(
+        pretrained_model_name_or_path_or_dict, weight_name=weight_name, **kwargs
+    )
+    lora_meta = parse_lora_metadata(sft_metadata, adapter_config)
+    return convert_krea2_lora_to_flax(state_dict, adapter_name, weights_dtype, lora_meta=lora_meta)
 
   @classmethod
   def make_lora_interceptor(cls, ranks_by_path, network_alphas_by_path, adapter_name, scale=1.0):
@@ -175,6 +232,12 @@ def maybe_load_krea2_lora(config, weights_dtype=jnp.bfloat16):
         adapter_name=adapter_name,
         weights_dtype=weights_dtype,
     )
+    if not ranks and not diffs:
+      raise ValueError(
+          f"LoRA adapter '{adapter_name}' from {model_path} contains no keys applicable to the "
+          "Krea 2 transformer (see the skipped/unmatched key warnings above). The file is likely "
+          "in an unsupported format or was trained for a different model."
+      )
     flat_lora_params.update(lora_params)
     for path, delta in diffs.items():
       scaled = jnp.asarray(delta) * scale

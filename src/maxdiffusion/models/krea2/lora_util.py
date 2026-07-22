@@ -20,12 +20,19 @@ limitations under the License.
 # `lora_A`/`lora_B`) state-dict styles, including `.alpha`, `.diff` and
 # `.diff_b` entries.
 
+import json
+import math
 import re
 
 import jax.numpy as jnp
 import numpy as np
 
 from maxdiffusion import max_logging
+
+# Key diffusers uses to embed the PEFT LoraConfig in safetensors metadata
+# (diffusers loaders/lora_base.py, LORA_ADAPTER_METADATA_KEY). Values inside the
+# JSON blob are prefixed per component, e.g. "transformer.lora_alpha".
+DIFFUSERS_LORA_METADATA_KEY = "lora_adapter_metadata"
 
 # Suffix -> canonical entry kind. `.diff_b` must be tested before `.diff`.
 _SUFFIX_PATTERNS = (
@@ -127,6 +134,9 @@ def krea2_torch_path_to_flax_path(torch_path: str):
   # diffusers wraps the output projection in a container: to_out.0 -> to_out.
   if len(parts) >= 2 and parts[-1] == "0" and parts[-2] == "to_out":
     parts = parts[:-1]
+  # kohya flattens the same container into to_out_0.
+  if parts[-1] == "to_out_0":
+    parts[-1] = "to_out"
 
   if parts[0] == "transformer_blocks":
     if len(parts) < 3 or not parts[1].isdigit():
@@ -239,16 +249,89 @@ def normalize_krea2_lora_state_dict(state_dict):
   return modules, skipped_te_keys, unmatched_keys
 
 
-def convert_krea2_lora_to_flax(state_dict, adapter_name, weights_dtype=jnp.bfloat16):
+def parse_lora_metadata(sft_metadata=None, adapter_config=None):
+  """Extracts default LoRA scaling settings from side-channel sources.
+
+  PEFT keeps `lora_alpha`/`use_rslora` in `adapter_config.json` and modern
+  diffusers embeds the same LoraConfig as JSON in the safetensors metadata
+  (`lora_adapter_metadata`, keys prefixed per component). Kohya files carry
+  `ss_network_alpha` in the safetensors metadata. Returns
+  `{"lora_alpha": float | None, "use_rslora": bool, "alpha_pattern": dict}`.
+  `adapter_config` (a parsed adapter_config.json dict) takes precedence over
+  the safetensors metadata.
+  """
+  meta = {"lora_alpha": None, "use_rslora": False, "alpha_pattern": {}}
+
+  def _take(cfg):
+    if cfg.get("lora_alpha") is not None:
+      meta["lora_alpha"] = float(cfg["lora_alpha"])
+    if cfg.get("use_rslora") is not None:
+      use_rslora = cfg["use_rslora"]
+      meta["use_rslora"] = use_rslora if isinstance(use_rslora, bool) else str(use_rslora).lower() == "true"
+    if isinstance(cfg.get("alpha_pattern"), dict):
+      meta["alpha_pattern"] = {str(k): float(v) for k, v in cfg["alpha_pattern"].items()}
+
+  sft_metadata = sft_metadata or {}
+  raw = sft_metadata.get(DIFFUSERS_LORA_METADATA_KEY)
+  if raw:
+    try:
+      packed = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+      max_logging.log(f"WARNING: could not parse safetensors '{DIFFUSERS_LORA_METADATA_KEY}' metadata; ignoring it.")
+      packed = {}
+    # Prefer transformer-prefixed keys; fall back to un-prefixed (flat) keys.
+    transformer_cfg = {k[len("transformer.") :]: v for k, v in packed.items() if k.startswith("transformer.")}
+    flat_cfg = {k: v for k, v in packed.items() if "." not in k}
+    _take(transformer_cfg or flat_cfg)
+
+  # Kohya stores the training-wide network alpha as a metadata string.
+  if meta["lora_alpha"] is None and sft_metadata.get("ss_network_alpha") is not None:
+    try:
+      meta["lora_alpha"] = float(sft_metadata["ss_network_alpha"])
+    except (TypeError, ValueError):
+      pass
+
+  if adapter_config:
+    _take(adapter_config)
+  return meta
+
+
+def _resolve_network_alpha(torch_path, rank, explicit_alpha, lora_meta):
+  """Per-module alpha: an explicit kohya `.alpha` tensor wins (plain alpha/rank
+  semantics), then a PEFT `alpha_pattern` match, then the default `lora_alpha`.
+  Metadata-derived alphas honor `use_rslora` (scaling alpha/sqrt(rank)) by
+  returning `alpha * sqrt(rank)`, since `LoRALinearLayer` multiplies by
+  `network_alpha / rank`. Returns None when no source defines an alpha (factor
+  1.0, i.e. alpha == rank)."""
+  if explicit_alpha is not None:
+    return explicit_alpha
+  if not lora_meta:
+    return None
+  alpha = None
+  for pattern, pattern_alpha in lora_meta.get("alpha_pattern", {}).items():
+    if pattern in torch_path:
+      alpha = float(pattern_alpha)
+      break
+  if alpha is None:
+    alpha = lora_meta.get("lora_alpha")
+  if alpha is None:
+    return None
+  if lora_meta.get("use_rslora"):
+    return alpha * math.sqrt(rank)
+  return alpha
+
+
+def convert_krea2_lora_to_flax(state_dict, adapter_name, weights_dtype=jnp.bfloat16, lora_meta=None):
   """Converts a Krea 2 LoRA state dict into Flax-ready tensors.
 
   Returns:
     flat_lora_params: {(*flax_module_path, "lora-{adapter}", "down"/"up", "kernel"): jnp array}
       matching the params `LoRALinearLayer` creates under interception.
     ranks_by_path: {flax_module_path: int} per-module LoRA rank.
-    network_alphas_by_path: {flax_module_path: float | None}; None means no alpha
-      key was present (kohya's implicit alpha == rank, i.e. scaling factor 1.0,
-      which is also correct for PEFT files with pre-baked scaling).
+    network_alphas_by_path: {flax_module_path: float | None}; resolved per module
+      from the explicit `.alpha` tensor, then `lora_meta` (see
+      `parse_lora_metadata` / `_resolve_network_alpha`); None means no source
+      defined an alpha (kohya's implicit alpha == rank, i.e. factor 1.0).
     diff_updates: {flat_param_path: numpy delta} additive updates to base params
       (norm weights, scale_shift_tables, full-weight `.diff`, bias `.diff_b`),
       already in Flax layout (kernels transposed).
@@ -292,7 +375,7 @@ def convert_krea2_lora_to_flax(state_dict, adapter_name, weights_dtype=jnp.bfloa
           flat_lora_params[(*flax_path, lora_name, "down", "kernel")] = jnp.asarray(down.T, dtype=weights_dtype)
           flat_lora_params[(*flax_path, lora_name, "up", "kernel")] = jnp.asarray(up.T, dtype=weights_dtype)
           ranks_by_path[flax_path] = rank
-          network_alphas_by_path[flax_path] = entry.get("alpha")
+          network_alphas_by_path[flax_path] = _resolve_network_alpha(torch_path, rank, entry.get("alpha"), lora_meta)
 
     diff = entry.get("diff")
     if diff is not None:

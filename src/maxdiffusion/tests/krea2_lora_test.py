@@ -16,6 +16,7 @@ limitations under the License.
 
 # CPU-runnable unit tests for Krea 2 inference-time LoRA loading.
 
+import os
 import unittest
 
 import flax
@@ -33,9 +34,11 @@ from maxdiffusion.loaders.krea2_lora_pipeline import (
     insert_lora_params,
 )
 from maxdiffusion.models.krea2.lora_util import (
+    DIFFUSERS_LORA_METADATA_KEY,
     convert_krea2_lora_to_flax,
     krea2_torch_path_to_flax_path,
     normalize_krea2_lora_state_dict,
+    parse_lora_metadata,
 )
 from maxdiffusion.models.krea2.transformer_krea2_flax import Krea2Transformer2DModel
 from maxdiffusion.models.krea2.util import prepare_krea2_image_ids, prepare_krea2_text_ids
@@ -132,6 +135,24 @@ class NormalizeStateDictTest(unittest.TestCase):
     self.assertIn("diff", modules["transformer_blocks.0.scale_shift_table"])
     self.assertIn("diff_b", modules["img_in"])
 
+  def test_kohya_to_out_0_keys_map_to_output_projection(self):
+    """Regression test: kohya flattens diffusers' to_out.0 container into
+    to_out_0, which must land on the Flax to_out module, not in unmatched."""
+    rng = np.random.RandomState(0)
+    state_dict = {
+        "lora_unet_transformer_blocks_0_attn_to_out_0.lora_down.weight": _rand(rng, 2, 32),
+        "lora_unet_transformer_blocks_0_attn_to_out_0.lora_up.weight": _rand(rng, 32, 2),
+        "lora_unet_text_fusion_refiner_blocks_0_attn_to_out_0.lora_down.weight": _rand(rng, 2, 24),
+        "lora_unet_text_fusion_refiner_blocks_0_attn_to_out_0.lora_up.weight": _rand(rng, 24, 2),
+    }
+    modules, _, unmatched = normalize_krea2_lora_state_dict(state_dict)
+    self.assertEqual(unmatched, [])
+    flat_lora, ranks, _, _ = convert_krea2_lora_to_flax(state_dict, "test", weights_dtype=jnp.float32)
+    self.assertIn(("blocks_0", "attn", "to_out"), ranks)
+    self.assertIn(("text_fusion", "refiner_blocks_0", "attn", "to_out"), ranks)
+    self.assertIn(("blocks_0", "attn", "to_out", "lora-test", "down", "kernel"), flat_lora)
+    self.assertEqual(len(modules), 2)
+
   def test_fused_qkv_raises(self):
     state_dict = {"lora_unet_transformer_blocks_0_attn_qkv.lora_down.weight": np.zeros((2, 32), np.float32)}
     with self.assertRaises(NotImplementedError):
@@ -158,6 +179,7 @@ class TorchPathToFlaxPathTest(unittest.TestCase):
     cases = {
         "transformer_blocks.3.attn.to_q": ("blocks_3", "attn", "to_q"),
         "transformer_blocks.3.attn.to_out.0": ("blocks_3", "attn", "to_out"),
+        "transformer_blocks.3.attn.to_out_0": ("blocks_3", "attn", "to_out"),
         "transformer_blocks.3.attn.to_out": ("blocks_3", "attn", "to_out"),
         "transformer_blocks.3.ff.gate": ("blocks_3", "ff", "gate_proj"),
         "transformer_blocks.3.ff.down_proj": ("blocks_3", "ff", "down_proj"),
@@ -255,6 +277,169 @@ class ConverterTest(unittest.TestCase):
     flat_lora, ranks, _, _ = convert_krea2_lora_to_flax(state_dict, "test")
     self.assertEqual(flat_lora, {})
     self.assertEqual(ranks, {})
+
+
+class ParseLoraMetadataTest(unittest.TestCase):
+
+  def test_diffusers_prefixed_metadata(self):
+    import json
+
+    raw = json.dumps(
+        {"transformer.r": 8, "transformer.lora_alpha": 32, "transformer.use_rslora": False, "text_encoder.lora_alpha": 7}
+    )
+    meta = parse_lora_metadata({DIFFUSERS_LORA_METADATA_KEY: raw})
+    self.assertEqual(meta["lora_alpha"], 32.0)
+    self.assertFalse(meta["use_rslora"])
+
+  def test_flat_metadata_and_alpha_pattern(self):
+    import json
+
+    raw = json.dumps({"r": 4, "lora_alpha": 16, "use_rslora": True, "alpha_pattern": {"to_q": 8}})
+    meta = parse_lora_metadata({DIFFUSERS_LORA_METADATA_KEY: raw})
+    self.assertEqual(meta["lora_alpha"], 16.0)
+    self.assertTrue(meta["use_rslora"])
+    self.assertEqual(meta["alpha_pattern"], {"to_q": 8.0})
+
+  def test_kohya_ss_network_alpha_fallback(self):
+    meta = parse_lora_metadata({"ss_network_alpha": "16.0", "ss_network_dim": "32"})
+    self.assertEqual(meta["lora_alpha"], 16.0)
+
+  def test_adapter_config_takes_precedence(self):
+    import json
+
+    raw = json.dumps({"lora_alpha": 16})
+    meta = parse_lora_metadata({DIFFUSERS_LORA_METADATA_KEY: raw}, adapter_config={"lora_alpha": 64, "use_rslora": True})
+    self.assertEqual(meta["lora_alpha"], 64.0)
+    self.assertTrue(meta["use_rslora"])
+
+  def test_empty_sources(self):
+    meta = parse_lora_metadata({}, None)
+    self.assertIsNone(meta["lora_alpha"])
+    self.assertFalse(meta["use_rslora"])
+
+
+class MetadataAlphaConverterTest(unittest.TestCase):
+  """Default alpha resolution for PEFT/diffusers adapters without .alpha tensors."""
+
+  def _peft_state_dict(self, rng):
+    return {
+        "transformer.transformer_blocks.0.attn.to_q.lora_A.weight": _rand(rng, 8, 32),
+        "transformer.transformer_blocks.0.attn.to_q.lora_B.weight": _rand(rng, 32, 8),
+        "transformer.transformer_blocks.0.ff.gate.lora_A.weight": _rand(rng, 8, 32),
+        "transformer.transformer_blocks.0.ff.gate.lora_B.weight": _rand(rng, 64, 8),
+    }
+
+  def test_metadata_default_alpha_applied(self):
+    lora_meta = {"lora_alpha": 32.0, "use_rslora": False, "alpha_pattern": {}}
+    _, _, alphas, _ = convert_krea2_lora_to_flax(
+        self._peft_state_dict(np.random.RandomState(0)), "test", lora_meta=lora_meta
+    )
+    self.assertEqual(alphas[("blocks_0", "attn", "to_q")], 32.0)
+    self.assertEqual(alphas[("blocks_0", "ff", "gate_proj")], 32.0)
+
+  def test_rslora_scaling(self):
+    # LoRALinearLayer multiplies by network_alpha / rank; rslora needs
+    # alpha / sqrt(rank), i.e. network_alpha = alpha * sqrt(rank).
+    lora_meta = {"lora_alpha": 32.0, "use_rslora": True, "alpha_pattern": {}}
+    _, ranks, alphas, _ = convert_krea2_lora_to_flax(
+        self._peft_state_dict(np.random.RandomState(0)), "test", lora_meta=lora_meta
+    )
+    rank = ranks[("blocks_0", "attn", "to_q")]
+    self.assertEqual(rank, 8)
+    self.assertAlmostEqual(alphas[("blocks_0", "attn", "to_q")], 32.0 * np.sqrt(8), places=5)
+
+  def test_alpha_pattern_overrides_default(self):
+    lora_meta = {"lora_alpha": 32.0, "use_rslora": False, "alpha_pattern": {"to_q": 8.0}}
+    _, _, alphas, _ = convert_krea2_lora_to_flax(
+        self._peft_state_dict(np.random.RandomState(0)), "test", lora_meta=lora_meta
+    )
+    self.assertEqual(alphas[("blocks_0", "attn", "to_q")], 8.0)
+    self.assertEqual(alphas[("blocks_0", "ff", "gate_proj")], 32.0)
+
+  def test_explicit_alpha_tensor_wins_over_metadata(self):
+    rng = np.random.RandomState(0)
+    state_dict = {
+        "lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight": _rand(rng, 2, 32),
+        "lora_unet_transformer_blocks_0_attn_to_q.lora_up.weight": _rand(rng, 32, 2),
+        "lora_unet_transformer_blocks_0_attn_to_q.alpha": np.float32(4.0),
+    }
+    lora_meta = {"lora_alpha": 32.0, "use_rslora": True, "alpha_pattern": {}}
+    _, _, alphas, _ = convert_krea2_lora_to_flax(state_dict, "test", lora_meta=lora_meta)
+    self.assertEqual(alphas[("blocks_0", "attn", "to_q")], 4.0)
+
+
+class LoraStateDictLoadingTest(unittest.TestCase):
+  """File resolution and metadata round-trips through lora_state_dict."""
+
+  def _save_adapter(self, tmpdir, name="adapter.safetensors", metadata=None):
+    import torch
+    from safetensors.torch import save_file
+
+    sd = {
+        "lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight": torch.randn(2, 32),
+        "lora_unet_transformer_blocks_0_attn_to_q.lora_up.weight": torch.randn(32, 2),
+    }
+    path = os.path.join(tmpdir, name)
+    save_file(sd, path, metadata=metadata)
+    return path
+
+  def test_file_metadata_round_trip(self):
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      raw = json.dumps({"transformer.lora_alpha": 32, "transformer.r": 2})
+      path = self._save_adapter(tmpdir, metadata={DIFFUSERS_LORA_METADATA_KEY: raw})
+      state_dict, sft_metadata, adapter_config = Krea2LoraLoaderMixin.lora_state_dict(path)
+      self.assertEqual(len(state_dict), 2)
+      self.assertEqual(parse_lora_metadata(sft_metadata, adapter_config)["lora_alpha"], 32.0)
+
+  def test_directory_without_weight_name_picks_single_file(self):
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      self._save_adapter(tmpdir)
+      with open(os.path.join(tmpdir, "adapter_config.json"), "w") as f:
+        json.dump({"r": 2, "lora_alpha": 16, "use_rslora": False}, f)
+      state_dict, _, adapter_config = Krea2LoraLoaderMixin.lora_state_dict(tmpdir)
+      self.assertEqual(len(state_dict), 2)
+      self.assertEqual(adapter_config["lora_alpha"], 16)
+
+  def test_directory_with_multiple_files_requires_weight_name(self):
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      self._save_adapter(tmpdir, "a.safetensors")
+      self._save_adapter(tmpdir, "b.safetensors")
+      with self.assertRaisesRegex(ValueError, "weight_name"):
+        Krea2LoraLoaderMixin.lora_state_dict(tmpdir)
+      state_dict, _, _ = Krea2LoraLoaderMixin.lora_state_dict(tmpdir, weight_name="b.safetensors")
+      self.assertEqual(len(state_dict), 2)
+
+  def test_incompatible_adapter_fails_loudly(self):
+    import tempfile
+
+    import torch
+    from safetensors.torch import save_file
+
+    from maxdiffusion.loaders.krea2_lora_pipeline import maybe_load_krea2_lora
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      path = os.path.join(tmpdir, "te_only.safetensors")
+      save_file({"lora_te_text_model_encoder_layers_0_mlp_fc1.lora_down.weight": torch.randn(2, 8)}, path)
+
+      class FakeConfig:
+        lora_config = {
+            "lora_model_name_or_path": [path],
+            "weight_name": [os.path.basename(path)],
+            "adapter_name": ["broken"],
+            "scale": [1.0],
+            "from_pt": ["true"],
+        }
+
+      with self.assertRaisesRegex(ValueError, "no keys applicable"):
+        maybe_load_krea2_lora(FakeConfig(), jnp.float32)
 
 
 class _DenseHost(nn.Module):
